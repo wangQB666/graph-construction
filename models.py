@@ -333,6 +333,65 @@ class Generator(nn.Module):
             {'params': self.output.parameters(), 'lr': lr},
         ]
 
+class Bert_Encoder(nn.Module):
+    def __init__(self, bert, bert_trainable=True):
+        super(Bert_Encoder, self).__init__()
+
+        self.add_module('bert', bert)
+        if not bert_trainable:
+            for m in self.bert.parameters():
+                m.requires_grad = False
+
+    def forward(self, ids, token_type_ids, attention_mask):
+        token_feat = self.bert(ids,
+                               token_type_ids=token_type_ids,
+                               attention_mask=attention_mask)[0]
+        sentence_feat = torch.sum(token_feat * attention_mask.unsqueeze(-1), dim=1) \
+                        / torch.sum(attention_mask, dim=1, keepdim=True)
+
+        return sentence_feat, token_feat
+
+    def get_config_optim(self, lrp):
+        return [
+            {'params': self.bert.parameters(), 'lr': lrp},
+        ]
+
+
+class Discriminator(nn.Module):
+    def __init__(self, num_classes, input_dim=768, num_hidden_discriminator=1, hidden_dim_discriminator=500):
+        super(Discriminator, self).__init__()
+
+        self.dropout = nn.Dropout(p=0.5)
+        self.act = nn.LeakyReLU(0.2)#nn.ReLU()
+
+        self.num_hidden_discriminator = num_hidden_discriminator
+        self.hidden_list_discriminator = nn.ModuleList()
+        for i in range(num_hidden_discriminator):
+            dim = input_dim if i == 0 else hidden_dim_discriminator
+            self.hidden_list_discriminator.append(nn.Linear(dim, hidden_dim_discriminator))
+
+        self.Linear = nn.Linear(hidden_dim_discriminator, (num_classes + 1))
+        self.output = nn.Softmax(dim=-1)
+
+    def forward(self, feat):
+        # x = self.dropout(feat)
+        x = feat
+        for i in range(self.num_hidden_discriminator):
+            x = self.hidden_list_discriminator[i](x)
+            x = self.act(x)
+            # x = self.dropout(x)
+
+        flatten = x
+        logit = self.Linear(x)
+        prob = self.output(logit)
+        return flatten, logit, prob
+
+    def get_config_optim(self, lr):
+        return [
+            {'params': self.hidden_list_discriminator.parameters(), 'lr': lr},
+            {'params': self.Linear.parameters(), 'lr': lr},
+            {'params': self.output.parameters(), 'lr': lr},
+        ]
 
 class MLPBert(nn.Module):
     def __init__(self, bert, num_classes, hidden_dim, hidden_layer_num, bert_trainable=True):
