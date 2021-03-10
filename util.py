@@ -3,7 +3,7 @@ from urllib.request import urlretrieve
 import torch
 from tqdm import tqdm
 import numpy as np
-
+from sklearn.metrics import accuracy_score, f1_score
 
 def download_url(url, destination=None, progress_bar=True):
     """Download a URL to a local file.
@@ -170,7 +170,7 @@ class AveragePrecisionMeter(object):
         targets = self.targets.cpu().numpy()
         targets[targets == -1] = 0
         n, c = self.scores.size()
-        scores = np.zeros((n, c)) - 1
+        scores = np.zeros((n, c))
         index = self.scores.topk(k, 1, True, True)[1].cpu().numpy()
         tmp = self.scores.cpu().numpy()
         for i in range(n):
@@ -179,7 +179,6 @@ class AveragePrecisionMeter(object):
         return self.evaluation(scores, targets)
 
     def evaluation(self, scores_, targets_):
-
         n, n_class = scores_.shape
         Nc, Np, Ng = np.zeros(n_class), np.zeros(n_class), np.zeros(n_class)
         for k in range(n_class):
@@ -190,26 +189,31 @@ class AveragePrecisionMeter(object):
             Np[k] = np.sum(scores >= 0.5)
             Nc[k] = np.sum(targets * (scores >= 0.5))
 
+        for i in range(len(scores_)):
+            max_value = max(scores_[i])
+            for j in range(len(scores_[i])):
+                if max_value == scores_[i][j]:
+                    scores_[i][j] = 1
+                else:
+                    scores_[i][j] = 0
+        acc = accuracy_score(targets_,scores_)
         # Np[Np == 0] = 1
         OP = np.sum(Nc) / np.sum(Np + 1e-5)
         OR = np.sum(Nc) / np.sum(Ng + 1e-5)
         OF1 = (2 * OP * OR) / (OP + OR + 1e-5)
 
+        # P = Nc / (Np + 1e-5)
+        # R = Nc / (Ng + 1e-5)
+        # print(P)
+        # print(R)
+        # print((2 * P * R) / (P + R + 1e-5))
+        # print('_______')
+
         CP = np.sum(Nc / (Np + 1e-5)) / n_class
         CR = np.sum(Nc / (Ng + 1e-5)) / n_class
         CF1 = (2 * CP * CR) / (CP + CR + 1e-5)
-
-        # print(Ng / n)
-        # print(Np / n)
-
-        # P = Nc / (Np + 1e-5)
-        # R = Nc / (Ng + 1e-5)
-        # # print(P)
-        # # print(R)
-        # print((2 * P * R) / (P + R + 1e-5))
-        # print("----------")
-
-        return OP, OR, OF1, CP, CR, CF1
+        
+        return acc, OR, OF1, CP, CR, CF1
 
 
 def gen_A(num_classes, t, co_occur_mat):
@@ -233,6 +237,12 @@ def gen_adj(A):
     return adj
 
 
-def prepareData():
+# Unsupervised Loss
+def unsupervised_Loss_fun(y_pred_unlabeled):
+        unlabeled = torch.logsumexp(y_pred_unlabeled, dim=1)
+        loss = -torch.mean(unlabeled) + torch.mean(F.softplus(unlabeled))
+        return loss
 
-    return
+def generator_loss_fun(y_pred_fake):
+    fake = torch.logsumexp(y_pred_fake, dim=1)
+    return -torch.mean(F.softplus(fake))

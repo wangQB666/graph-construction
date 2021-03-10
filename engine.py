@@ -125,18 +125,29 @@ class Engine(object):
 
         val_loader = torch.utils.data.DataLoader(dataset.test_data,
                                                  batch_size=self.state['batch_size'], shuffle=False,
-                                                 num_workers=self.state['workers'], collate_fn=dataset.collate_fn)
+                                                 num_workers=1, collate_fn=dataset.collate_fn) #self.state['workers']
+
+        # optionally resume from a checkpoint
+        if self._state('resume') is not None:
+            if os.path.isfile(self.state['resume']):
+                print("=> loading checkpoint '{}'".format(self.state['resume']))
+                checkpoint = torch.load(self.state['resume'])
+                self.state['start_epoch'] = checkpoint['epoch']
+                self.state['best_score'] = checkpoint['best_score']
+                model['Generator'].load_state_dict(checkpoint['state_dict-Generator'])
+                model['Classifier'].load_state_dict(checkpoint['state_dict-Classifier'])
+                print("=> loaded checkpoint '{}' (epoch {})"
+                      .format(self.state['evaluate'], checkpoint['epoch']))
+            else:
+                print("=> no checkpoint found at '{}'".format(self.state['resume']))
 
         if self.state['use_gpu']:
             # train_loader.pin_memory = True
             # val_loader.pin_memory = True
             # cudnn.benchmark = True
 
-            model['Discriminator'] = model['Discriminator'].cuda(self.state['device_ids'][0])
             model['Generator'] = model['Generator'].cuda(self.state['device_ids'][0])
-            model['Encoder'] = model['Encoder'].cuda(self.state['device_ids'][0])
-            model['MABert'] = model['MABert'].cuda(self.state['device_ids'][0])
-
+            model['Classifier'] = model['Classifier'].cuda(self.state['device_ids'][0])
 
             # model = torch.nn.DataParallel(model, device_ids=self.state['device_ids'])
             if 'encoded_tag' in self.state:
@@ -146,7 +157,8 @@ class Engine(object):
             criterion = criterion.cuda(self.state['device_ids'][0])
 
         if self.state['evaluate']:
-            self.validate(val_loader, model, criterion)
+            self.state['epoch'] = self.state['start_epoch']
+            self.validate(val_loader, model, criterion, self.state['epoch'])
             return
 
         # TODO define optimizer
@@ -159,7 +171,7 @@ class Engine(object):
             # train for one epoch
             print("Train with labeled data:")
             self.train(train_loader, model, criterion, optimizer, epoch, False)
-
+            #
             if self.state['method'] == 'semiGAN_MultiLabelMAP':
                 # train for one epoch
                 print("Train with unlabeled data:")
@@ -169,22 +181,29 @@ class Engine(object):
             prec1 = self.validate(val_loader, model, criterion, epoch)
 
             # remember best prec@1 and save checkpoint
-            # is_best = prec1 > self.state['best_score']
+            # is_best = prec1['OF1'] > self.state['best_score']['OF1']
+            # self.save_checkpoint({
+            #     'epoch': epoch + 1,
+            #     # 'arch': self._state('arch'),
+            #     'state_dict-Generator': model['Generator'].state_dict() if self.state['use_gpu'] else model['Generator'].state_dict(),
+            #     'state_dict-Classifier': model['Classifier'].state_dict() if self.state['use_gpu'] else model['Classifier'].state_dict(),
+            #     'best_score': self.state['best_score'],
+            # }, is_best)
 
-            self.state['best_score']['map'] = max(prec1['map'], self.state['best_score']['map'])
-            if prec1['OF1'] >= self.state['best_score']['OF1']:
+            # self.state['best_score']['map'] = max(prec1['map'], self.state['best_score']['map'])
+            if prec1['CF1'] > self.state['best_score']['CF1']:
+                self.state['best_score']['map'] = prec1['map']
                 self.state['best_score']['OF1'] = prec1['OF1']
                 self.state['best_score']['OP'] = prec1['OP']
                 self.state['best_score']['OR'] = prec1['OR']
-            if prec1['CF1'] >= self.state['best_score']['CF1']:
                 self.state['best_score']['CF1'] = prec1['CF1']
                 self.state['best_score']['CP'] = prec1['CP']
                 self.state['best_score']['CR'] = prec1['CR']
 
-            best_str = '**best** map={map:.3f} OP={OP:.3f} OR={OR:.3f} OF1={OF1:.3f} CP={CP:.3f} CR={CR:.3f} CF1={CF1:.3f}'.format(
-                map=self.state['best_score']['map'], OP=self.state['best_score']['OP'], OR=self.state['best_score']['OR'],
-                OF1=self.state['best_score']['OF1'], CP=self.state['best_score']['CP'],
-                CR=self.state['best_score']['CR'], CF1=self.state['best_score']['CF1'])
+            best_str = '**best** map={map:.3f} OF1={OF1:.3f} CF1={CF1:.3f}'.format(
+                map=100 * self.state['best_score']['map'], 
+                OF1=100 * self.state['best_score']['OF1'], 
+                CF1=100 * self.state['best_score']['CF1'])
 
             print(best_str)
             self.result_file.write(best_str + '\n')
@@ -194,10 +213,8 @@ class Engine(object):
     def train(self, data_loader, model, criterion, optimizer, epoch, semi_supervised):
 
         # switch to train mode
-        model['Discriminator'].train()
         model['Generator'].train()
-        model['Encoder'].train()
-        model['MABert'].train()
+        model['Classifier'].train()
 
         self.on_start_epoch(True, model, criterion, data_loader, optimizer)
 
@@ -233,11 +250,8 @@ class Engine(object):
     @torch.no_grad()
     def validate(self, data_loader, model, criterion, epoch):
         # switch to evaluate mode
-
-        model['Discriminator'].eval()
         model['Generator'].eval()
-        model['Encoder'].eval()
-        model['MABert'].eval()
+        model['Classifier'].eval()
 
         self.on_start_epoch(False, model, criterion, data_loader)
 
@@ -259,11 +273,12 @@ class Engine(object):
             if self.state['use_gpu']:
                 self.state['target'] = self.state['target'].cuda(self.state['device_ids'][0])
 
-            output = self.on_forward(False, model, criterion, data_loader)
+            output, ids, dscp_tokens, attention = self.on_forward(False, model, criterion, data_loader)
 
-            #record the detials of the result:
-            # if epoch == self.state['max_epochs'] - 1:
-            #     self.recordResult(target, output)
+            # record the detials of the result:
+            # if epoch == self.state['max_epochs'] - 1 or self.state['evaluate']:
+            #     # self.recordResult(target, output)
+            #     self.recordResult(ids, dscp_tokens, attention, target, output)
 
             # measure elapsed time
             self.state['batch_time_current'] = time.time() - end
@@ -276,20 +291,46 @@ class Engine(object):
 
         return score
 
-    def recordResult(self, target, output):
+    def recordResult(self, ids, dscp_tokens, attention, target, output):
         result = []
-        for i in range(len(target)):
-            buf = [self.state['dscp'][i],
-                   [self.state['id2tag'][index] for (index, value) in enumerate(target[i]) if value == 1],
-                   [self.state['id2tag'][index] for index in
-                    sorted(range(len(output[i])), key=lambda k: output[i][k], reverse=True)[:10]]]
-            if buf[2][0] not in buf[1]:
-                result.append(buf)
+        # print(ids.shape)
+        # print(attention.shape)
 
-        with open('testResult.json', 'a') as f:
+        for i in range(len(dscp_tokens)):
+            buf = []
+            # print(self.state['dscp'][i])
+            # print(dscp_tokens[i])
+            # print(len(dscp_tokens[i]))
+            for j in range(len(dscp_tokens[i])):
+                buf.append([dscp_tokens[i][j],
+                            [self.state['id2tag'][index] + ": {:.2f}".format(attention[i][index][j+1].data.cpu().numpy())
+                             for (index, value) in enumerate(target[i]) if value == 1],
+                            [self.state['id2tag'][index] + ": {:.2f}".format(attention[i][index][j+1].data.cpu().numpy())
+                             for index in sorted(range(len(output[i])), key=lambda k: output[i][k], reverse=True)[:5]]
+                            ])
+            result.append(buf)
+            # print(ids[i])
+            # print(attention[i][0][len(dscp_tokens[i])+2])
+        # print(result)
+
+        with open(os.path.join(self.state['result_path_method'], 'testResult.json'), 'a') as f:
             json.dump(result, f)
 
+    # def recordResult(self, target, output):
+    #     result = []
+    #     for i in range(len(target)):
+    #         buf = [self.state['dscp'][i],
+    #                [self.state['id2tag'][index] for (index, value) in enumerate(target[i]) if value == 1],
+    #                [self.state['id2tag'][index] for index in
+    #                 sorted(range(len(output[i])), key=lambda k: output[i][k], reverse=True)[:10]]]
+    #         if buf[2][0] not in buf[1]:
+    #             result.append(buf)
+    #
+    #     with open('testResult.json', 'a') as f:
+    #         json.dump(result, f)
+
     def save_checkpoint(self, state, is_best, filename='checkpoint.pth.tar'):
+
         if self._state('save_model_path') is not None:
             filename_ = filename
             filename = os.path.join(self.state['save_model_path'], filename_)
@@ -297,6 +338,7 @@ class Engine(object):
                 os.makedirs(self.state['save_model_path'])
         print('save model {filename}'.format(filename=filename))
         torch.save(state, filename)
+
         if is_best:
             filename_best = 'model_best.pth.tar'
             if self._state('save_model_path') is not None:
@@ -306,9 +348,10 @@ class Engine(object):
                 if self._state('filename_previous_best') is not None:
                     os.remove(self._state('filename_previous_best'))
                 filename_best = os.path.join(self.state['save_model_path'],
-                                             'model_best_{score:.4f}.pth.tar'.format(score=state['best_score']))
+                                             'model_best_{score:.4f}.pth.tar'.format(score=state['best_score']['OF1']))
                 shutil.copyfile(filename, filename_best)
                 self.state['filename_previous_best'] = filename_best
+
 
     def adjust_learning_rate(self, optimizer):
         """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
@@ -329,11 +372,12 @@ class MultiLabelMAPEngine(Engine):
         self.state['ap_meter'] = AveragePrecisionMeter(self.state['difficult_examples'])
 
     def on_forward(self, training, model, criterion, data_loader, optimizer=None, display=True, semi_supervised=False):
-        target_var = self.state['target']
-        ids, token_type_ids, attention_mask = self.state['input']
+        target_var = self.state['target']#.type(torch.LongTensor).cuda(self.state['device_ids'][0])
+        ids, token_type_ids, attention_mask, dscp_tokens = self.state['input']
         ids = ids.cuda(self.state['device_ids'][0])
         token_type_ids = token_type_ids.cuda(self.state['device_ids'][0])
         attention_mask = attention_mask.cuda(self.state['device_ids'][0])
+        dscp_tokens = dscp_tokens #.cuda(self.state['device_ids'][0])
 
         if training:
             self.state['train_iters'] += 1
@@ -341,47 +385,50 @@ class MultiLabelMAPEngine(Engine):
             self.state['eval_iters'] += 1
 
         z = torch.rand(ids.shape[0], 1, 768).type(torch.FloatTensor).cuda(self.state['device_ids'][0])
-        x_g = model['Generator'](z)
+        x_g = model['Generator'](z, self.state['encoded_tag'], self.state['tag_mask'])
 
-        _, logits, prob = model['MABert'](ids, token_type_ids, attention_mask,
+        _, logits, _, attention = model['Classifier'](ids, token_type_ids, attention_mask,
                                                                       self.state['encoded_tag'],
-                                                                      self.state['tag_mask'], x_g.detach())#
+                                                                      self.state['tag_mask'], x_g.detach())
 
         self.state['output'] = logits
-        self.state['loss'] = criterion(self.state['output'], target_var)
+
+        self.state['loss'] = criterion(logits, target_var)
 
         if training:
-            optimizer['enc'].zero_grad()
+            optimizer['Classifier'].zero_grad()
             self.state['loss'].backward()
-            nn.utils.clip_grad_norm_(optimizer['enc'].param_groups[0]["params"], max_norm=10.0)
-            optimizer['enc'].step()
+            nn.utils.clip_grad_norm_(optimizer['Classifier'].param_groups[0]["params"], max_norm=10.0)
+            optimizer['Classifier'].step()
         else:
-            return self.state['output']
+            return self.state['output'], ids, dscp_tokens, attention
 
     def on_start_epoch(self, training, model, criterion, data_loader, optimizer=None, display=True):
         Engine.on_start_epoch(self, training, model, criterion, data_loader, optimizer)
         self.state['ap_meter'].reset()
 
     def on_end_epoch(self, training, model, criterion, data_loader, optimizer=None, display=True):
-        map = 100 * self.state['ap_meter'].value().mean()
+        map = self.state['ap_meter'].value().mean()
         loss = self.state['meter_loss'].value()[0]
         OP, OR, OF1, CP, CR, CF1 = self.state['ap_meter'].overall()
         OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = self.state['ap_meter'].overall_topk(3)
         if display:
             if training:
                 reselt_str = 'Epoch: [{0}]\t Loss {loss:.4f}\t mAP {map:.3f} \n ' \
-                'OP: {OP:.4f}\t OR: {OR:.4f}\t OF1: {OF1:.4f}\t CP: {CP:.4f}\t CR: {CR:.4f}\t CF1: {CF1:.4f}'.format(
-                self.state['epoch'], loss=loss, map=map, OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1)
+                'OP: {OP:.3f}\t OR: {OR:.3f}\t OF1: {OF1:.3f}\t CP: {CP:.3f}\t CR: {CR:.3f}\t CF1: {CF1:.3f}'.format(
+                self.state['epoch'], loss=loss, map=100 * map, OP=100 * OP, OR=100 * OR, OF1=100 * OF1, CP=100 * CP, CR=100 * CR, CF1=100 * CF1)
 
             else:
                 reselt_str = 'Test: \t Loss {loss:.4f}\t mAP {map:.3f} \n' \
-                'OP: {OP:.4f}\t OR: {OR:.4f}\t OF1: {OF1:.4f}\t CP: {CP:.4f}\t CR: {CR:.4f}\t CF1: {CF1:.4f} \n' \
-                'OP_3: {OP_3:.4f}\t OR_3: {OR_3:.4f}\t OF1_3: {OF1_3:.4f}\t CP_3: {CP_3:.4f}\t CR_3: {CR_3:.4f}\t CF1_3: {CF1_3:.4f}'.format(
-                    loss=loss, map=map, OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1,
-                    OP_3=OP_k, OR_3=OR_k, OF1_3=OF1_k, CP_3=CP_k, CR_3=CR_k, CF1_3=CF1_k)
+                'OP: {OP:.3f}\t OR: {OR:.3f}\t OF1: {OF1:.3f}\t CP: {CP:.3f}\t CR: {CR:.3f}\t CF1: {CF1:.3f} \n' \
+                'OP_3: {OP_3:.3f}\t OR_3: {OR_3:.3f}\t OF1_3: {OF1_3:.3f}\t CP_3: {CP_3:.3f}\t CR_3: {CR_3:.3f}\t CF1_3: {CF1_3:.3f}'.format(
+                    loss=loss, map=100 * map, OP=100 * OP, OR=100 * OR, OF1=100 * OF1, CP=100 * CP, CR=100 * CR, CF1=100 * CF1,
+                    OP_3=100 * OP_k, OR_3=100 * OR_k, OF1_3=100 * OF1_k, CP_3=100 * CP_k, CR_3=100 * CR_k, CF1_3=100 * CF1_k)
 
             print(reselt_str)
             self.result_file.write(reselt_str + '\n')
+
+            result = {'map': map, 'OP': OP, 'OR': OR, 'OF1': OF1, 'CP': CP, 'CR': CR, 'CF1': CF1}
 
         if training:
             self.writer.add_scalar('loss/train_epoch_loss', loss, self.state['epoch'])
@@ -393,8 +440,6 @@ class MultiLabelMAPEngine(Engine):
             self.writer.add_scalar('mAP/eval_mAP', map, self.state['epoch'])
             self.writer.add_scalar('OF1/eval_OF1', OF1, self.state['epoch'])
             self.writer.add_scalar('CF1/eval_CF1', CF1, self.state['epoch'])
-
-        result = {'map':map, 'OP':OP, 'OR': OR, 'OF1':OF1, 'CP': CP, 'CR': CR, 'CF1': CF1}
 
         return result
 
@@ -438,14 +483,30 @@ class MultiLabelMAPEngine(Engine):
                     data_time=data_time, loss_current=self.state['loss_batch'], loss=loss))
 
 
+def unsupervised_Loss_fun(y_pred_unlabeled):
+        unlabeled = torch.logsumexp(y_pred_unlabeled, dim=1)
+        loss = -torch.mean(unlabeled) + torch.mean(F.softplus(unlabeled))
+        return loss
+
+def generator_loss_fun(y_pred_fake):
+    fake = torch.logsumexp(y_pred_fake, dim=1)
+    return -torch.mean(F.softplus(fake))
+
+def conditional_entropy(logits):
+    probs = nn.functional.softmax(logits)
+    ent = (- probs * logits).sum(1).squeeze() + torch.logsumexp(logits, dim=1)
+    return ent.mean()
+
 class semiGAN_MultiLabelMAPEngine(MultiLabelMAPEngine):
 
-    def on_forward(self, training, model, criterion, data_loader, optimizer=None, display=True, semi_supervised=False):
+    def on_forward(self, training, model, criterion, data_loader, optimizer=None, display=True,
+                   semi_supervised=False):
         target_var = self.state['target']
-        ids, token_type_ids, attention_mask = self.state['input']
+        ids, token_type_ids, attention_mask, dscp_tokens = self.state['input']
         ids = ids.cuda(self.state['device_ids'][0])
         token_type_ids = token_type_ids.cuda(self.state['device_ids'][0])
         attention_mask = attention_mask.cuda(self.state['device_ids'][0])
+        dscp_tokens = dscp_tokens
 
         if training:
             self.state['train_iters'] += 1
@@ -454,52 +515,52 @@ class semiGAN_MultiLabelMAPEngine(MultiLabelMAPEngine):
 
         epsilon = 1e-8
 
-        # z = torch.rand(ids.shape[0], 512, 768).type(torch.FloatTensor).cuda(self.state['device_ids'][0])
-
+        #z = torch.Tensor(1, 768).uniform_(-1, 1).cuda(self.state['device_ids'][0])
         z = torch.Tensor(ids.shape[0], 1, 768).uniform_(0, 1).cuda(self.state['device_ids'][0])
         # target_zeros = torch.zeros(ids.shape[0], 71).cuda(self.state['device_ids'][0])
 
-        x_g = model['Generator'](z)
+        x_g = model['Generator'](z, self.state['encoded_tag'], self.state['tag_mask'])
 
-        #-----------train enc-----------
-        flatten, logits, prob = model['MABert'](ids, token_type_ids, attention_mask,
-                                                                      self.state['encoded_tag'],
-                                                                      self.state['tag_mask'], x_g.detach())#
+        # -----------train enc-----------
+        flatten, logits, prob, attention = model['Classifier'](ids, token_type_ids, attention_mask,
+                                                self.state['encoded_tag'],
+                                                self.state['tag_mask'], x_g.detach())  # x_g.detach()
 
         self.state['output'] = logits
 
-        D_L_unsupervised = -1 * torch.mean(torch.log(1 - prob + epsilon))
-        D_L_unsupervised2 = -1 * torch.mean(torch.log(flatten + epsilon))
+        # unsupervised_Loss = unsupervised_Loss_fun(flatten)
+        # generator_loss = generator_loss_fun(prob)
+        # conditional_ent = conditional_entropy(flatten)
 
+        D_L_unsupervised = -1 * torch.mean(torch.log(1 - prob + epsilon)) #1 -
+        # D_L_unsupervised2 = -1 * torch.mean(torch.log(flatten + epsilon))
 
-        if semi_supervised == False: #train with labeled data
+        if semi_supervised == False:  # train with labeled data
             d_loss = criterion(self.state['output'], target_var)
 
-            # d_loss = criterion(self.state['output'], target_var) + D_L_unsupervised + D_L_unsupervised2
-
             if training:
-                optimizer['enc'].zero_grad()
+                optimizer['Classifier'].zero_grad()
                 d_loss.backward()
-                nn.utils.clip_grad_norm_(optimizer['enc'].param_groups[0]["params"], max_norm=10.0)
-                optimizer['enc'].step()
+                nn.utils.clip_grad_norm_(optimizer['Classifier'].param_groups[0]["params"], max_norm=10.0)
+                optimizer['Classifier'].step()
 
             self.state['loss'] = [d_loss, d_loss]
 
         else:
-            # -----------train Generator-----------
-            d_loss = D_L_unsupervised + D_L_unsupervised2
+            d_loss = D_L_unsupervised #+ D_L_unsupervised2 #unsupervised_Loss - generator_loss#
             if training:
-                optimizer['enc'].zero_grad()
+                optimizer['Classifier'].zero_grad()
                 d_loss.backward()
-                nn.utils.clip_grad_norm_(optimizer['enc'].param_groups[0]["params"], max_norm=10.0)
-                optimizer['enc'].step()
+                nn.utils.clip_grad_norm_(optimizer['Classifier'].param_groups[0]["params"], max_norm=10.0)
+                optimizer['Classifier'].step()
 
-            flatten, _, prob = model['MABert'](ids, token_type_ids, attention_mask,
+            flatten, _, prob, _ = model['Classifier'](ids, token_type_ids, attention_mask,
                                                self.state['encoded_tag'],
                                                self.state['tag_mask'], x_g)
+            # generator_loss = generator_loss_fun(prob)
 
-            g_loss = -1 * torch.mean(torch.log(prob + epsilon))
-
+            g_loss = -1 * torch.mean(torch.log(prob + epsilon))#+flatten # #+ generator_loss#
+ 
             if training:
                 optimizer['Generator'].zero_grad()
                 g_loss.backward()
@@ -509,7 +570,7 @@ class semiGAN_MultiLabelMAPEngine(MultiLabelMAPEngine):
             self.state['loss'] = [d_loss, g_loss]
 
         if not training:
-            return self.state['output']
+            return self.state['output'], ids, dscp_tokens, attention
 
     def on_end_batch(self, training, model, criterion, data_loader, optimizer=None, display=True):
 
